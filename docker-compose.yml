@@ -1,0 +1,67 @@
+# Litterbox Local push relay: holds the maintainer's APNs key and forwards notifications for
+# self-hosted Litterbox Local servers. Runs behind Traefik, which terminates TLS.
+#
+#   1. cp .env.example .env  and fill in the RELAY_APNS_* values and RELAY_ADMIN_TOKEN
+#   2. put the APNs .p8 key next to this file as apns-auth-key.p8
+#   3. docker compose up -d
+
+services:
+  relay:
+    image: ${RELAY_IMAGE:-ghcr.io/nc1107/litterbox-local-relay:latest}
+    build: .
+    restart: unless-stopped
+    environment:
+      RELAY_HTTP_ADDR: ":8090"
+      RELAY_DB_PATH: "/data/relay.db"
+      RELAY_ADMIN_TOKEN: ${RELAY_ADMIN_TOKEN:-}
+      # Traefik, behind Cloudflare, sets X-Forwarded-For. The client is the first address in
+      # it that is not a Cloudflare or private one (RELAY_TRUSTED_PROXIES).
+      RELAY_TRUST_PROXY: "true"
+      RELAY_APNS_KEY_PATH: "/run/secrets/apns-auth-key.p8"
+      RELAY_APNS_KEY_ID: ${RELAY_APNS_KEY_ID:?set RELAY_APNS_KEY_ID in .env}
+      RELAY_APNS_TEAM_ID: ${RELAY_APNS_TEAM_ID:?set RELAY_APNS_TEAM_ID in .env}
+      RELAY_APNS_BUNDLE_ID: ${RELAY_APNS_BUNDLE_ID:?set RELAY_APNS_BUNDLE_ID in .env}
+      RELAY_APNS_PRODUCTION: ${RELAY_APNS_PRODUCTION:-true}
+    # The relay only writes to its data volume, and needs no privilege at all.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Admin is reachable from the host only: Traefik excludes /admin below, and this port is
+    # bound to loopback. Use curl against http://127.0.0.1:8090/admin/keys on the server.
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - relay_data:/data
+      - ./apns-auth-key.p8:/run/secrets/apns-auth-key.p8:ro
+    healthcheck:
+      # Distroless has no shell or curl, so the binary probes itself.
+      test: ["CMD", "/app/relay", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    networks:
+      - traefik_proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik_proxy
+      - traefik.http.routers.litterbox-relay.rule=Host(`litterbox-relay.${DOMAIN:-npc-server.top}`) && !PathPrefix(`/admin`)
+      - traefik.http.routers.litterbox-relay.entrypoints=websecure
+      - traefik.http.routers.litterbox-relay.tls=true
+      - traefik.http.routers.litterbox-relay.tls.certresolver=cloudflare
+      - traefik.http.routers.litterbox-relay.middlewares=secureHeaders@file
+      - traefik.http.services.litterbox-relay.loadbalancer.server.port=8090
+      - com.centurylinklabs.watchtower.enable=true
+
+networks:
+  traefik_proxy:
+    external: true
+
+volumes:
+  relay_data:
